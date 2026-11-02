@@ -186,6 +186,12 @@ func NewSQLiteWithTypedFields(root string, store storage.Storage, typedLinkField
 	// Construction has no caller ctx — the schema bootstrap and initial
 	// reindex run with Background. Production calls pass a real ctx.
 	ctx := context.Background()
+	indexExists, err := s.migrateTrigram(ctx)
+	if err != nil {
+		writeDB.Close()
+		readDB.Close()
+		return nil, err
+	}
 	if err := s.createSchema(ctx); err != nil {
 		writeDB.Close()
 		readDB.Close()
@@ -198,7 +204,7 @@ func NewSQLiteWithTypedFields(root string, store storage.Storage, typedLinkField
 		readDB.Close()
 		return nil, err
 	}
-	if empty {
+	if empty && !indexExists {
 		start := time.Now()
 		n, err := s.reindexLocked(ctx)
 		if err != nil {
@@ -212,16 +218,12 @@ func NewSQLiteWithTypedFields(root string, store storage.Storage, typedLinkField
 }
 
 func (s *SQLite) createSchema(ctx context.Context) error {
-	if err := s.migrateContentless(ctx); err != nil {
-		return err
-	}
-
 	const ddl = `
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 	path UNINDEXED,
 	content,
-	content='',
-	tokenize = 'porter unicode61 remove_diacritics 1'
+	content='', contentless_delete=1,
+	tokenize = 'trigram'
 );
 CREATE TABLE IF NOT EXISTS doc_paths (
 	rowid INTEGER PRIMARY KEY,
@@ -406,25 +408,66 @@ FROM failed_searches
 `)
 }
 
-// migrateContentless detects a pre-contentless FTS5 docs table and drops it
-// so createSchema can recreate it with content=”. The reindex at startup
-// will repopulate it.
-func (s *SQLite) migrateContentless(ctx context.Context) error {
+// migrateTrigram rebuilds only the FTS index and path mapping. Contentless
+// tables cannot supply the old text: storage is the source of truth. Keep the
+// old index intact if any file cannot be read or indexed, and leave metadata,
+// analytics and application-owned tables/views alone. The bool reports whether
+// an existing index was handled, including an empty one; the caller must not
+// follow this with a full reindex that would clear unrelated metadata.
+func (s *SQLite) migrateTrigram(ctx context.Context) (bool, error) {
 	var ddl string
 	err := s.writeDB.QueryRowContext(ctx,
 		`SELECT sql FROM sqlite_master WHERE type='table' AND name='docs'`).Scan(&ddl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return nil
+		return false, fmt.Errorf("inspect docs schema: %w", err)
 	}
-	if strings.Contains(ddl, "content=") {
-		return nil
+	normalized := strings.NewReplacer(" ", "", "\n", "", "	", "", "\r", "").Replace(strings.ToLower(ddl))
+	if strings.Contains(normalized, "tokenize='trigram'") &&
+		strings.Contains(normalized, "content=''") && strings.Contains(normalized, "contentless_delete=1") {
+		var count int
+		if err := s.writeDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM doc_paths`).Scan(&count); err != nil {
+			return false, fmt.Errorf("inspect doc_paths: %w", err)
+		}
+		if count > 0 {
+			return true, nil
+		}
 	}
-	log.Printf("kiwifs search: migrating to contentless FTS5, reindexing...")
-	if _, err := s.writeDB.ExecContext(ctx, `DROP TABLE IF EXISTS docs`); err != nil {
-		return fmt.Errorf("drop old docs: %w", err)
+	log.Printf("kiwifs search: rebuilding contentless trigram FTS5...")
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
 	}
-	s.writeDB.ExecContext(ctx, `DROP TABLE IF EXISTS doc_paths`)
-	return nil
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DROP TABLE docs;
+CREATE VIRTUAL TABLE docs USING fts5(path UNINDEXED, content, content='', contentless_delete=1, tokenize = 'trigram');
+CREATE TABLE IF NOT EXISTS doc_paths(rowid INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+DELETE FROM doc_paths;`); err != nil {
+		return false, fmt.Errorf("migrate docs schema: %w", err)
+	}
+	err = storage.WalkFilter(ctx, s.store, "/", func(e storage.Entry) bool {
+		return storage.IsKnowledgeFile(e.Path)
+	}, func(e storage.Entry) error {
+		content, err := s.store.Read(ctx, e.Path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", e.Path, err)
+		}
+		rid := pathRowID(e.Path)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO docs(rowid, path, content) VALUES (?, ?, ?)`, rid, e.Path, searchableText(string(content))); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO doc_paths(rowid, path) VALUES (?, ?)`, rid, e.Path)
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("migrate trigram index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit trigram migration: %w", err)
+	}
+	return true, nil
 }
 
 func (s *SQLite) isEmpty(ctx context.Context) (bool, error) {
@@ -914,7 +957,7 @@ func (s *SQLite) Index(ctx context.Context, path string, content []byte) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO docs(rowid, path, content) VALUES (?, ?, ?)`,
+		`INSERT OR REPLACE INTO docs(rowid, path, content) VALUES (?, ?, ?)`,
 		rowid, path, searchableText(string(content))); err != nil {
 		tx.Rollback()
 		return err
@@ -931,7 +974,7 @@ func (s *SQLite) IndexBatch(ctx context.Context, files []IndexEntry) error {
 		return err
 	}
 	defer tx.Rollback()
-	docStmt, err := tx.PrepareContext(ctx, `INSERT INTO docs(rowid, path, content) VALUES (?, ?, ?)`)
+	docStmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO docs(rowid, path, content) VALUES (?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -1013,7 +1056,9 @@ func (s *SQLite) Resync(ctx context.Context) (added, removed int, err error) {
 	}
 
 	onDisk := make(map[string]struct{})
-	walkErr := storage.Walk(ctx, s.store, "/", func(e storage.Entry) error {
+	walkErr := storage.WalkFilter(ctx, s.store, "/", func(e storage.Entry) bool {
+		return storage.IsKnowledgeFile(e.Path)
+	}, func(e storage.Entry) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
@@ -2152,8 +2197,8 @@ const reindexBatchSize = 500
 // over the WAL) see progress and aren't stuck behind a multi-second
 // megatransaction.
 func (s *SQLite) reindexLocked(ctx context.Context) (int, error) {
-	// The docs table is a contentless FTS5 virtual table (content=''),
-	// which does not support DELETE FROM. Drop and recreate it instead.
+	// Recreate the contentless index to reclaim postings left behind by
+	// path-only deletes as well as removing all currently visible rows.
 	if _, err := s.writeDB.ExecContext(ctx, `DROP TABLE IF EXISTS docs`); err != nil {
 		return 0, fmt.Errorf("drop docs: %w", err)
 	}
@@ -2161,8 +2206,8 @@ func (s *SQLite) reindexLocked(ctx context.Context) (int, error) {
 		CREATE VIRTUAL TABLE docs USING fts5(
 			path UNINDEXED,
 			content,
-			content='',
-			tokenize = 'porter unicode61 remove_diacritics 1'
+			content='', contentless_delete=1,
+			tokenize = 'trigram'
 		)`); err != nil {
 		return 0, fmt.Errorf("recreate docs: %w", err)
 	}
@@ -2258,7 +2303,9 @@ func (s *SQLite) reindexLocked(ctx context.Context) (int, error) {
 	// automatically — the previous filepath.WalkDir baked a local-FS
 	// assumption directly into the search layer, undoing the "storage-
 	// agnostic" claim the Storage interface is supposed to give us.
-	walkErr := storage.Walk(ctx, s.store, "/", func(e storage.Entry) error {
+	walkErr := storage.WalkFilter(ctx, s.store, "/", func(e storage.Entry) bool {
+		return storage.IsKnowledgeFile(e.Path)
+	}, func(e storage.Entry) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}

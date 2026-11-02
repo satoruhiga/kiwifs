@@ -687,8 +687,11 @@ with p99 latency under 200ms when properly tuned.
 	t.Logf("Search latency: %s (avg of 100)", searchDur.Round(time.Microsecond))
 	t.Logf("IndexBatch 100: %s", batchDur.Round(time.Millisecond))
 
-	if ratio > 2.0 {
-		t.Errorf("index/raw ratio %.2fx exceeds 2.0x target (want <1.5x)", ratio)
+	// Trigram postings retain positions for substring phrases. Unlike Porter's
+	// word index, this deliberately trades a larger index for CJK recall.
+	const maxTrigramIndexRatio = 10.0
+	if ratio > maxTrigramIndexRatio {
+		t.Errorf("trigram index/raw ratio %.2fx exceeds %.1fx budget", ratio, maxTrigramIndexRatio)
 	}
 }
 
